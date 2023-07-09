@@ -273,7 +273,7 @@ func (da *DigestAuth) CheckAuthMulitple(r *http.Request) (username string, authi
 	check := func(HA1 string) bool {
 		HA2 := H(r.Method + ":" + auth["uri"])
 		KD := H(strings.Join([]string{HA1, auth["nonce"], auth["nc"], auth["cnonce"], auth["qop"], HA2}, ":"))
-		return subtle.ConstantTimeCompare([]byte(KD), []byte(auth["response"])) != 1
+		return subtle.ConstantTimeCompare([]byte(KD), []byte(auth["response"])) == 1
 	}
 
 	passedHA1 := ""
