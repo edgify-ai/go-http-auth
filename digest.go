@@ -28,6 +28,7 @@ type DigestAuth struct {
 	Realm            string
 	Opaque           string
 	Secrets          SecretProvider
+	MultiSecrets     []SecretProvider
 	PlainTextSecrets bool
 	IgnoreNonceCount bool
 	// Headers used by authenticator. Set to ProxyHeaders to use with
@@ -212,6 +213,107 @@ func (da *DigestAuth) CheckAuth(r *http.Request) (username string, authinfo *str
 	return auth["username"], &info
 }
 
+// CheckAuth checks whether the request contains valid authentication
+// data. Returns a pair of username, authinfo, where username is the
+// name of the authenticated user or an empty string and authinfo is
+// the contents for the optional Authentication-Info response header.
+func (da *DigestAuth) CheckAuthMulitple(r *http.Request) (username string, authinfo *string) {
+	da.mutex.RLock()
+	defer da.mutex.RUnlock()
+	username = ""
+	authinfo = nil
+	auth := DigestAuthParams(r.Header.Get(da.Headers.V().Authorization))
+	if auth == nil {
+		return "", nil
+	}
+	// RFC2617 Section 3.2.1 specifies that unset value of algorithm in
+	// WWW-Authenticate Response header should be treated as
+	// "MD5". According to section 3.2.2 the "algorithm" value in
+	// subsequent Request Authorization header must be set to whatever
+	// was supplied in the WWW-Authenticate Response header. This
+	// implementation always returns an algorithm in WWW-Authenticate
+	// header, however there seems to be broken clients in the wild
+	// which do not set the algorithm. Assume the unset algorithm in
+	// Authorization header to be equal to MD5.
+	if _, ok := auth["algorithm"]; !ok {
+		auth["algorithm"] = "MD5"
+	}
+	if da.Opaque != auth["opaque"] || auth["algorithm"] != "MD5" || auth["qop"] != "auth" {
+		return "", nil
+	}
+
+	// Check if the requested URI matches auth header
+	if r.RequestURI != auth["uri"] {
+		// We allow auth["uri"] to be a full path prefix of request-uri
+		// for some reason lost in history, which is probably wrong, but
+		// used to be like that for quite some time
+		// (https://tools.ietf.org/html/rfc2617#section-3.2.2 explicitly
+		// says that auth["uri"] is the request-uri).
+		//
+		// TODO: make an option to allow only strict checking.
+		switch u, err := url.Parse(auth["uri"]); {
+		case err != nil:
+			return "", nil
+		case r.URL == nil:
+			return "", nil
+		case len(u.Path) > len(r.URL.Path):
+			return "", nil
+		case !strings.HasPrefix(r.URL.Path, u.Path):
+			return "", nil
+		}
+	}
+
+	getHA1 := func(secret SecretProvider) string {
+		HA1 := secret(auth["username"], da.Realm)
+		if da.PlainTextSecrets {
+			HA1 = H(auth["username"] + ":" + da.Realm + ":" + HA1)
+		}
+		return HA1
+	}
+
+	check := func(HA1 string) bool {
+		HA2 := H(r.Method + ":" + auth["uri"])
+		KD := H(strings.Join([]string{HA1, auth["nonce"], auth["nc"], auth["cnonce"], auth["qop"], HA2}, ":"))
+		return subtle.ConstantTimeCompare([]byte(KD), []byte(auth["response"])) != 1
+	}
+
+	passedHA1 := ""
+	for _, secret := range da.MultiSecrets { // should still be constant time as checking all secrets
+		HA1 := getHA1(secret)
+		if check(HA1) {
+			passedHA1 = HA1
+		}
+	}
+
+	if passedHA1 == "" { // not passed verification
+		return "", nil
+	}
+
+	// At this point crypto checks are completed and validated.
+	// Now check if the session is valid.
+
+	nc, err := strconv.ParseUint(auth["nc"], 16, 64)
+	if err != nil {
+		return "", nil
+	}
+
+	client, ok := da.clients[auth["nonce"]]
+	if !ok {
+		return "", nil
+	}
+	if client.nc != 0 && client.nc >= nc && !da.IgnoreNonceCount {
+		return "", nil
+	}
+	client.nc = nc
+	client.lastSeen = time.Now().UnixNano()
+
+	respHA2 := H(":" + auth["uri"])
+	rspauth := H(strings.Join([]string{passedHA1, auth["nonce"], auth["nc"], auth["cnonce"], auth["qop"], respHA2}, ":"))
+
+	info := fmt.Sprintf(`qop="auth", rspauth="%s", cnonce="%s", nc="%s"`, rspauth, auth["cnonce"], auth["nc"])
+	return auth["username"], &info
+}
+
 // Default values for ClientCacheSize and ClientCacheTolerance for DigestAuth
 const (
 	DefaultClientCacheSize      = 1000
@@ -280,6 +382,18 @@ func NewDigestAuthenticator(realm string, secrets SecretProvider) *DigestAuth {
 		Opaque:               RandomKey(),
 		Realm:                realm,
 		Secrets:              secrets,
+		PlainTextSecrets:     false,
+		ClientCacheSize:      DefaultClientCacheSize,
+		ClientCacheTolerance: DefaultClientCacheTolerance,
+		clients:              map[string]*digestClient{}}
+	return da
+}
+
+func NewDigestMultiAuthenticator(realm string, secrets []SecretProvider) *DigestAuth {
+	da := &DigestAuth{
+		Opaque:               RandomKey(),
+		Realm:                realm,
+		MultiSecrets:         secrets,
 		PlainTextSecrets:     false,
 		ClientCacheSize:      DefaultClientCacheSize,
 		ClientCacheTolerance: DefaultClientCacheTolerance,
