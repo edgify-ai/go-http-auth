@@ -27,7 +27,7 @@ This is a complete working example for Basic auth:
             "fmt"
             "net/http"
 
-            auth "github.com/abbot/go-http-auth"
+            auth "github.com/edgify-ai/go-http-auth"
     )
 
     func Secret(user, realm string) string {
