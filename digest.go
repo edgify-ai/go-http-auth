@@ -111,7 +111,6 @@ func (da *DigestAuth) RequireAuth(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf(`Digest realm="%s", nonce="%s", opaque="%s", algorithm=MD5, qop="auth"`,
 			da.Realm, nonce, da.Opaque))
 	w.WriteHeader(da.Headers.V().UnauthCode)
-	w.Write([]byte(da.Headers.V().UnauthResponse))
 	da.mutex.RUnlock()
 }
 
